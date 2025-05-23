@@ -8,6 +8,7 @@ import sys
 from typing import List, Set, Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
 from colorama import Fore, Style, init
+from proxygen import ProxyCollector
 
 init()
 
@@ -20,18 +21,18 @@ def log(message: str, level: str = "i") -> None:
     }
     print(f"{levels.get(level, levels['i'])} {message}")
 
-def read_proxies(file_path: str) -> List[str]:
-    if not file_path:
-        return []
-    
-    try:
-        with open(file_path, 'r') as f:
-            proxies = [line.strip() for line in f if line.strip()]
-            log(f"Loaded {len(proxies)} proxies from file", "s")
-            return proxies
-    except Exception as e:
-        log(f"Error reading proxies file: {str(e)}", "e")
-        return []
+async def get_fresh_proxies(proxy_manager, min_count=20):
+    log("Collecting fresh proxies...", "i")
+    collector = ProxyCollector(progress=True)
+    proxies = await collector.get_working_proxies()
+    if not proxies or len(proxies) < min_count:
+        log("Not enough working proxies found, retrying...", "w")
+        proxies = await collector.get_working_proxies()
+    proxy_manager["proxies"] = proxies
+    proxy_manager["blacklisted_proxies"] = set()
+    proxy_manager["current_proxy"] = None
+    log(f"Loaded {len(proxies)} fresh proxies", "s")
+    return proxies
 
 def create_proxy_manager(proxies: List[str]) -> Dict[str, Any]:
     return {
@@ -45,17 +46,15 @@ def proxy_rotate(proxy_manager: Dict[str, Any]) -> Optional[str]:
     blacklisted = proxy_manager["blacklisted_proxies"]
     current_proxy = proxy_manager["current_proxy"]
 
-    if not proxies:
+    if not proxies or len(proxies) == len(blacklisted):
         return None
 
     available_proxies = [p for p in proxies if p not in blacklisted]
 
     if not available_proxies:
-        log("All proxies blacklisted, temporarily using direct connection", "w")
-        proxy_manager["current_proxy"] = None
         return None
 
-    if current_proxy in blacklisted:
+    if current_proxy in blacklisted or current_proxy not in available_proxies:
         current_proxy = None
 
     if current_proxy is None:
@@ -86,7 +85,14 @@ async def fetch_with_retry(
     backoff_factor: float = 1.0
 ) -> Tuple[Optional[str], bool]:
     last_error = None
-    for attempt in range(max_retries):
+    attempt = 0
+    while True:
+        if len(proxy_manager["proxies"]) == 0 or len(proxy_manager["blacklisted_proxies"]) >= len(proxy_manager["proxies"]):
+            await get_fresh_proxies(proxy_manager)
+            if not proxy_manager["proxies"]:
+                log("No proxies available, aborting fetch.", "e")
+                return None, False
+
         proxy = proxy_rotate(proxy_manager)
         try:
             async with session.get(
@@ -98,25 +104,24 @@ async def fetch_with_retry(
                     return await response.text(), True
                 if response.status == 404:
                     return None, True
-                
+
                 error_msg = f"HTTP {response.status} for {url}"
                 last_error = error_msg
                 log(error_msg, "w")
-                
+
                 if response.status in [400, 403, 429, 500, 502, 503]:
                     if proxy is not None:
                         proxy_blacklist(proxy_manager, proxy)
-                
+
                 await asyncio.sleep(backoff_factor * (attempt + 1))
         except Exception as e:
             last_error = str(e)
-            log(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}", "w")
+            log(f"Attempt {attempt + 1} failed: {str(e)}", "w")
             if proxy is not None:
                 proxy_blacklist(proxy_manager, proxy)
             await asyncio.sleep(backoff_factor * (attempt + 1))
-    
-    log(f"Failed to fetch {url} after {max_retries} attempts. Last error: {last_error}", "e")
-    return None, False
+
+        attempt += 1
 
 async def get_cdx_indexes(
     session: aiohttp.ClientSession,
@@ -125,7 +130,7 @@ async def get_cdx_indexes(
 ) -> Tuple[List[str], bool]:
     url = "http://index.commoncrawl.org/collinfo.json"
     data, success = await fetch_with_retry(session, url, proxy_manager, timeout)
-    
+
     if not success:
         log("Failed to fetch CDX indexes, trying direct connection...", "w")
         try:
@@ -136,10 +141,10 @@ async def get_cdx_indexes(
         except Exception as e:
             log(f"Direct connection also failed: {str(e)}", "e")
             return [], False
-    
+
     if not data:
         return [], False
-    
+
     try:
         indexes = json.loads(data)
         return [index['cdx-api'] for index in indexes], True
@@ -157,29 +162,29 @@ async def process_cdx_page(
     output_file: str
 ) -> Tuple[Set[str], bool]:
     data, success = await fetch_with_retry(session, url, proxy_manager, timeout)
-    
+
     if not success or not data:
         return found_domains, False
-    
+
     new_domains = set()
     for line in data.strip().split('\n'):
         try:
             record = json.loads(line)
             if not (url := record.get('url', '')):
                 continue
-            
+
             if (parsed := urlparse(url)).netloc and parsed.netloc.endswith(f".{tld}"):
                 domain = parsed.netloc.lower()
                 if domain not in found_domains:
                     new_domains.add(domain)
         except json.JSONDecodeError:
             continue
-    
+
     if new_domains:
         found_domains.update(new_domains)
         log(f"Found {len(new_domains)} new domains (total: {len(found_domains)})", "s")
         await save_domains(found_domains, output_file)
-    
+
     return found_domains, True
 
 async def process_cdx_api(
@@ -195,16 +200,16 @@ async def process_cdx_api(
     async with semaphore:
         url = f"{cdx_api}?url=*.{tld}&output=json&fl=url&showNumPages=true"
         data, success = await fetch_with_retry(session, url, proxy_manager, timeout)
-        
+
         if not success:
             return found_domains, False
-        
+
         try:
             if data is not None:
                 pages_info = json.loads(data)
                 total_pages = pages_info.get('pages', 0)
                 log(f"Found {total_pages} pages in {cdx_api}", "s")
-                
+
                 for page in range(total_pages):
                     page_url = f"{cdx_api}?url=*.{tld}&output=json&fl=url&page={page}"
                     found_domains, _ = await process_cdx_page(
@@ -218,7 +223,7 @@ async def process_cdx_api(
                 session, url, tld, found_domains,
                 proxy_manager, timeout, output_file
             )
-        
+
         return found_domains, True
 
 async def save_domains(domains: Set[str], output_file: str) -> None:
@@ -226,7 +231,7 @@ async def save_domains(domains: Set[str], output_file: str) -> None:
         temp_file = f"{output_file}.tmp"
         with open(temp_file, 'w') as f:
             f.writelines(f"{domain}\n" for domain in sorted(domains))
-        
+
         os.replace(temp_file, output_file)
     except Exception as e:
         log(f"Error saving domains: {str(e)}", "e")
@@ -239,48 +244,44 @@ async def main():
     parser.add_argument("-t", "--tld", required=True, help="TLD to extract (e.g., 'ir', 'com')")
     parser.add_argument("-o", "--output", default="domains.txt", help="Output file path")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of concurrent workers")
-    parser.add_argument("-p", "--proxies", help="Path to file containing proxies")
     parser.add_argument("--timeout", type=int, default=20, help="Request timeout in seconds")
     parser.add_argument("--retries", type=int, default=5, help="Max retries per request")
     parser.add_argument("--backoff", type=float, default=2.0, help="Backoff factor between retries")
-    
+
     args = parser.parse_args()
-    
-    proxies = read_proxies(args.proxies) if args.proxies else []
-    proxy_manager = create_proxy_manager(proxies)
-    
+
+    proxy_manager = create_proxy_manager([])
+    await get_fresh_proxies(proxy_manager)
+
     found_domains = set()
     semaphore = asyncio.Semaphore(args.workers)
-    
+
     os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
-    
+
     log(f"Starting extraction for TLD: {args.tld}", "s")
     log(f"Using {args.workers} workers", "i")
     log(f"Timeout set to {args.timeout} seconds", "i")
     log(f"Max retries: {args.retries}, Backoff factor: {args.backoff}", "i")
-    if proxies:
-        log(f"Using {len(proxies)} proxies", "i")
-    else:
-        log("No proxies provided, using direct connection", "w")
-    
+    log(f"Using auto-collected proxies", "i")
+
     connector = aiohttp.TCPConnector(
         limit=args.workers,
         force_close=True,
         enable_cleanup_closed=True
     )
-    
+
     async with aiohttp.ClientSession(connector=connector) as session:
         cdx_apis, success = await get_cdx_indexes(session, proxy_manager, args.timeout)
         if not success:
             log("Fatal: Could not retrieve CDX indexes after multiple attempts", "e")
             sys.exit(1)
-        
+
         if not cdx_apis:
             log("No CDX APIs found!", "e")
             return
-        
+
         log(f"Found {len(cdx_apis)} CDX APIs", "s")
-        
+
         tasks = []
         for api in cdx_apis:
             task = process_cdx_api(
@@ -289,12 +290,12 @@ async def main():
                 args.output, semaphore
             )
             tasks.append(task)
-        
+
         results = await asyncio.gather(*tasks)
-        
+
         success_count = sum(1 for _, success in results if success)
         log(f"Successfully processed {success_count}/{len(cdx_apis)} CDX APIs", "s")
-        
+
         await save_domains(found_domains, args.output)
         log(f"Finished! Total domains found: {len(found_domains)}", "s")
 
