@@ -23,7 +23,7 @@ def log(message: str, level: str = "i") -> None:
 
 async def get_fresh_proxies(proxy_manager, min_count=20):
     log("Collecting fresh proxies ...", "i")
-    collector = ProxyCollector(progress=True)
+    collector = ProxyCollector(timeout=5, concurrency=100, progress=True)
     proxies = []
     async for proxy in collector.iter_working_proxies():
         proxies.append(proxy)
