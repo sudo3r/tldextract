@@ -5,7 +5,7 @@ import json
 import os
 import random
 import sys
-from typing import List, Set, Optional, Tuple
+from typing import List, Set, Optional, Tuple, Dict, Any
 from urllib.parse import urlparse
 from colorama import Fore, Style, init
 
@@ -33,54 +33,61 @@ def read_proxies(file_path: str) -> List[str]:
         log(f"Error reading proxies file: {str(e)}", "e")
         return []
 
-class ProxyManager:
-    def __init__(self, proxies: List[str]):
-        self.proxies = proxies
-        self.current_proxy = None
-        self.blacklisted_proxies = set()
-    
-    def rotate(self) -> Optional[str]:
-        if not self.proxies:
-            return None
-        
-        available_proxies = [p for p in self.proxies if p not in self.blacklisted_proxies]
-        
-        if not available_proxies:
-            log("All proxies blacklisted, temporarily using direct connection", "w")
-            return None
-        
-        if self.current_proxy in self.blacklisted_proxies:
-            self.current_proxy = None
-        
-        if self.current_proxy is None:
-            self.current_proxy = random.choice(available_proxies)
-        else:
-            try:
-                current_index = available_proxies.index(self.current_proxy)
-                next_index = (current_index + 1) % len(available_proxies)
-                self.current_proxy = available_proxies[next_index]
-            except ValueError:
-                self.current_proxy = random.choice(available_proxies)
-        
-        log(f"Using proxy: {self.current_proxy}", "i")
-        return self.current_proxy
-    
-    def blacklist(self, proxy: str) -> None:
-        if proxy and proxy in self.proxies:
-            self.blacklisted_proxies.add(proxy)
-            log(f"Blacklisted proxy: {proxy}", "w")
+def create_proxy_manager(proxies: List[str]) -> Dict[str, Any]:
+    return {
+        "proxies": proxies,
+        "current_proxy": None,
+        "blacklisted_proxies": set()
+    }
+
+def proxy_rotate(proxy_manager: Dict[str, Any]) -> Optional[str]:
+    proxies = proxy_manager["proxies"]
+    blacklisted = proxy_manager["blacklisted_proxies"]
+    current_proxy = proxy_manager["current_proxy"]
+
+    if not proxies:
+        return None
+
+    available_proxies = [p for p in proxies if p not in blacklisted]
+
+    if not available_proxies:
+        log("All proxies blacklisted, temporarily using direct connection", "w")
+        proxy_manager["current_proxy"] = None
+        return None
+
+    if current_proxy in blacklisted:
+        current_proxy = None
+
+    if current_proxy is None:
+        current_proxy = random.choice(available_proxies)
+    else:
+        try:
+            current_index = available_proxies.index(current_proxy)
+            next_index = (current_index + 1) % len(available_proxies)
+            current_proxy = available_proxies[next_index]
+        except ValueError:
+            current_proxy = random.choice(available_proxies)
+
+    proxy_manager["current_proxy"] = current_proxy
+    log(f"Using proxy: {current_proxy}", "i")
+    return current_proxy
+
+def proxy_blacklist(proxy_manager: Dict[str, Any], proxy: str) -> None:
+    if proxy and proxy in proxy_manager["proxies"]:
+        proxy_manager["blacklisted_proxies"].add(proxy)
+        log(f"Blacklisted proxy: {proxy}", "w")
 
 async def fetch_with_retry(
     session: aiohttp.ClientSession,
     url: str,
-    proxy_manager: ProxyManager,
+    proxy_manager: Dict[str, Any],
     timeout: int,
     max_retries: int = 5,
     backoff_factor: float = 1.0
 ) -> Tuple[Optional[str], bool]:
     last_error = None
     for attempt in range(max_retries):
-        proxy = proxy_manager.rotate()
+        proxy = proxy_rotate(proxy_manager)
         try:
             async with session.get(
                 url,
@@ -98,14 +105,14 @@ async def fetch_with_retry(
                 
                 if response.status in [400, 403, 429, 500, 502, 503]:
                     if proxy is not None:
-                        proxy_manager.blacklist(proxy)
+                        proxy_blacklist(proxy_manager, proxy)
                 
                 await asyncio.sleep(backoff_factor * (attempt + 1))
         except Exception as e:
             last_error = str(e)
             log(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}", "w")
             if proxy is not None:
-                proxy_manager.blacklist(proxy)
+                proxy_blacklist(proxy_manager, proxy)
             await asyncio.sleep(backoff_factor * (attempt + 1))
     
     log(f"Failed to fetch {url} after {max_retries} attempts. Last error: {last_error}", "e")
@@ -113,7 +120,7 @@ async def fetch_with_retry(
 
 async def get_cdx_indexes(
     session: aiohttp.ClientSession,
-    proxy_manager: ProxyManager,
+    proxy_manager: Dict[str, Any],
     timeout: int
 ) -> Tuple[List[str], bool]:
     url = "http://index.commoncrawl.org/collinfo.json"
@@ -145,7 +152,7 @@ async def process_cdx_page(
     url: str,
     tld: str,
     found_domains: Set[str],
-    proxy_manager: ProxyManager,
+    proxy_manager: Dict[str, Any],
     timeout: int,
     output_file: str
 ) -> Tuple[Set[str], bool]:
@@ -180,7 +187,7 @@ async def process_cdx_api(
     cdx_api: str,
     tld: str,
     found_domains: Set[str],
-    proxy_manager: ProxyManager,
+    proxy_manager: Dict[str, Any],
     timeout: int,
     output_file: str,
     semaphore: asyncio.Semaphore
@@ -240,7 +247,7 @@ async def main():
     args = parser.parse_args()
     
     proxies = read_proxies(args.proxies) if args.proxies else []
-    proxy_manager = ProxyManager(proxies)
+    proxy_manager = create_proxy_manager(proxies)
     
     found_domains = set()
     semaphore = asyncio.Semaphore(args.workers)
