@@ -23,12 +23,16 @@ def log(message: str, level: str = "i") -> None:
 
 async def get_fresh_proxies(proxy_manager, min_count=20):
     log("Collecting fresh proxies ...", "i")
-    collector = ProxyCollector(timeout=5, concurrency=100, progress=True)
-    proxies = []
-    async for proxy in collector.iter_working_proxies():
-        proxies.append(proxy)
-        if len(proxies) >= min_count:
-            break
+    proxies = proxy_manager.get("proxies", [])
+    proxies = [p for p in proxies if p not in proxy_manager.get("blacklisted_proxies", set())]
+    needed = max(0, min_count - len(proxies))
+    if needed > 0:
+        collector = ProxyCollector(timeout=5, concurrency=100, progress=True)
+        async for proxy in collector.iter_working_proxies():
+            if proxy not in proxies:
+                proxies.append(proxy)
+            if len(proxies) >= min_count:
+                break
     proxy_manager["proxies"] = proxies
     proxy_manager["blacklisted_proxies"] = set()
     proxy_manager["current_proxy"] = None
