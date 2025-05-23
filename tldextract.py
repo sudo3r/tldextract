@@ -240,7 +240,7 @@ async def main():
     parser.add_argument("-o", "--output", default="domains.txt", help="Output file path")
     parser.add_argument("-w", "--workers", type=int, default=10, help="Number of concurrent workers")
     parser.add_argument("-p", "--proxies", help="Path to file containing proxies")
-    parser.add_argument("--timeout", type=int, default=60, help="Request timeout in seconds")
+    parser.add_argument("--timeout", type=int, default=20, help="Request timeout in seconds")
     parser.add_argument("--retries", type=int, default=5, help="Max retries per request")
     parser.add_argument("--backoff", type=float, default=2.0, help="Backoff factor between retries")
     
