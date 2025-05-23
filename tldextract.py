@@ -22,12 +22,13 @@ def log(message: str, level: str = "i") -> None:
     print(f"{levels.get(level, levels['i'])} {message}")
 
 async def get_fresh_proxies(proxy_manager, min_count=20):
-    log("Collecting fresh proxies...", "i")
+    log("Collecting fresh proxies (streaming)...", "i")
     collector = ProxyCollector(progress=True)
-    proxies = await collector.get_working_proxies()
-    if not proxies or len(proxies) < min_count:
-        log("Not enough working proxies found, retrying...", "w")
-        proxies = await collector.get_working_proxies()
+    proxies = []
+    async for proxy in collector.iter_working_proxies():
+        proxies.append(proxy)
+        if len(proxies) >= min_count:
+            break
     proxy_manager["proxies"] = proxies
     proxy_manager["blacklisted_proxies"] = set()
     proxy_manager["current_proxy"] = None
