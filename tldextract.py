@@ -97,13 +97,15 @@ async def fetch_with_retry(
                 log(error_msg, "w")
                 
                 if response.status in [400, 403, 429, 500, 502, 503]:
-                    proxy_manager.blacklist(proxy)
+                    if proxy is not None:
+                        proxy_manager.blacklist(proxy)
                 
                 await asyncio.sleep(backoff_factor * (attempt + 1))
         except Exception as e:
             last_error = str(e)
             log(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}", "w")
-            proxy_manager.blacklist(proxy)
+            if proxy is not None:
+                proxy_manager.blacklist(proxy)
             await asyncio.sleep(backoff_factor * (attempt + 1))
     
     log(f"Failed to fetch {url} after {max_retries} attempts. Last error: {last_error}", "e")
@@ -149,7 +151,7 @@ async def process_cdx_page(
 ) -> Tuple[Set[str], bool]:
     data, success = await fetch_with_retry(session, url, proxy_manager, timeout)
     
-    if not success:
+    if not success or not data:
         return found_domains, False
     
     new_domains = set()
@@ -191,16 +193,19 @@ async def process_cdx_api(
             return found_domains, False
         
         try:
-            pages_info = json.loads(data)
-            total_pages = pages_info.get('pages', 0)
-            log(f"Found {total_pages} pages in {cdx_api}", "s")
-            
-            for page in range(total_pages):
-                page_url = f"{cdx_api}?url=*.{tld}&output=json&fl=url&page={page}"
-                found_domains, _ = await process_cdx_page(
-                    session, page_url, tld, found_domains,
-                    proxy_manager, timeout, output_file
-                )
+            if data is not None:
+                pages_info = json.loads(data)
+                total_pages = pages_info.get('pages', 0)
+                log(f"Found {total_pages} pages in {cdx_api}", "s")
+                
+                for page in range(total_pages):
+                    page_url = f"{cdx_api}?url=*.{tld}&output=json&fl=url&page={page}"
+                    found_domains, _ = await process_cdx_page(
+                        session, page_url, tld, found_domains,
+                        proxy_manager, timeout, output_file
+                    )
+            else:
+                log(f"No data received from {cdx_api} for pages info", "w")
         except json.JSONDecodeError:
             found_domains, _ = await process_cdx_page(
                 session, url, tld, found_domains,
