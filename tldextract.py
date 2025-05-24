@@ -27,7 +27,7 @@ async def get_fresh_proxies(proxy_manager, min_count=20):
     proxies = [p for p in proxies if p not in proxy_manager.get("blacklisted_proxies", set())]
     needed = max(0, min_count - len(proxies))
     if needed > 0:
-        collector = ProxyCollector(timeout=5, concurrency=100, progress=True)
+        collector = ProxyCollector(timeout=5, concurrency=100, progress=False)
         async for proxy in collector.iter_working_proxies():
             if proxy not in proxies:
                 proxies.append(proxy)
